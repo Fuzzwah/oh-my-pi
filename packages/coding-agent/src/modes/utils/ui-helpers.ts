@@ -115,6 +115,7 @@ function imageLinksForMessage(
 
 export class UiHelpers {
 	constructor(private ctx: InteractiveModeContext) {}
+	#statusDismissTimer: NodeJS.Timeout | undefined;
 
 	/** Extract text content from a user message */
 	getUserMessageText(message: Message): string {
@@ -132,7 +133,9 @@ export class UiHelpers {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	showStatus(message: string, options?: { dim?: boolean }): void {
+	showStatus(message: string, options?: { dim?: boolean; autoDismissMs?: number }): void {
+		clearTimeout(this.#statusDismissTimer);
+		this.#statusDismissTimer = undefined;
 		const children = this.ctx.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
@@ -145,14 +148,29 @@ export class UiHelpers {
 			this.ctx.lastStatusText.setStyleFn(styleFn);
 			this.ctx.lastStatusText.setText(message);
 			this.ctx.ui.requestRender();
-			return;
+		} else {
+			const spacer = new Spacer(1);
+			const text = new Text(message, 1, 0).setStyleFn(styleFn);
+			this.ctx.present([spacer, text]);
+			this.ctx.lastStatusSpacer = spacer;
+			this.ctx.lastStatusText = text;
 		}
-
-		const spacer = new Spacer(1);
-		const text = new Text(message, 1, 0).setStyleFn(styleFn);
-		this.ctx.present([spacer, text]);
-		this.ctx.lastStatusSpacer = spacer;
-		this.ctx.lastStatusText = text;
+		if (options?.autoDismissMs !== undefined) {
+			this.#statusDismissTimer = setTimeout(() => {
+				this.#statusDismissTimer = undefined;
+				// Only blank the line while it is still the live tail; a superseded
+				// or scrollback-committed status must not be mutated.
+				const current = this.ctx.chatContainer.children;
+				if (
+					current.length >= 2 &&
+					current[current.length - 2] === this.ctx.lastStatusSpacer &&
+					current[current.length - 1] === this.ctx.lastStatusText
+				) {
+					this.ctx.lastStatusText.setText("");
+					this.ctx.ui.requestRender();
+				}
+			}, options.autoDismissMs);
+		}
 	}
 
 	addMessageToChat(message: AgentMessage, options?: AddMessageOptions): Component[] {

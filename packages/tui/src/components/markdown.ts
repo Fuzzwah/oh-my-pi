@@ -930,14 +930,17 @@ const EMPTY_RENDER_LINES: readonly string[] = [];
 interface RenderedLine {
 	text: string;
 	literalCode?: true;
+	/** Row belongs to the selected fenced code block; pad pass fills its background. */
+	highlighted?: true;
 }
 
 interface RenderedListItemLine extends RenderedLine {
 	nested: boolean;
 }
 
-function renderedLine(text: string, literalCode?: boolean): RenderedLine {
-	return literalCode ? { text, literalCode: true } : { text };
+function renderedLine(text: string, literalCode?: boolean, highlighted?: boolean): RenderedLine {
+	if (literalCode) return highlighted ? { text, literalCode: true, highlighted: true } : { text, literalCode: true };
+	return highlighted ? { text, highlighted: true } : { text };
 }
 
 const renderCache = new LRUCache<string, readonly string[]>({
@@ -1355,6 +1358,12 @@ export interface MarkdownTheme {
 	code: (text: string) => string;
 	codeBlock: (text: string) => string;
 	codeBlockBorder: (text: string) => string;
+	/**
+	 * Optional whole-line wrap for a selected fenced code block. Must apply a
+	 * background and reset it (e.g. `\x1b[48;5;Nm … \x1b[49m`); the wrapped
+	 * line's own foreground styling survives because only background is reset.
+	 */
+	codeBlockHighlight?: (line: string) => string;
 	quote: (text: string) => string;
 	quoteBorder: (text: string) => string;
 	hr: (text: string) => string;
@@ -1627,6 +1636,7 @@ interface RenderSignature {
 	paddingX: number;
 	paddingY: number;
 	codeBlockIndent: number;
+	highlightedFence: number;
 	themeId: number;
 	defaultTextStyleId: number;
 	imageProtocol: string;
@@ -1721,6 +1731,12 @@ export class Markdown implements Component {
 	#defaultStylePrefix?: string;
 	/** Number of spaces used to indent code block content. */
 	#codeBlockIndent: number;
+	/** Ordinal (0-based, column-0 backtick fences) of the selected code block; -1 = none. */
+	#highlightedFence = -1;
+	/** Token resolved for {@link #highlightedFence} on the current render pass. */
+	#highlightedFenceToken: Token | undefined;
+	/** Row span of the selected fence within the last full render's content lines. */
+	#highlightedFenceRows: { start: number; end: number } | undefined;
 
 	// Cache for rendered output. Cached arrays are shared and returned by
 	// reference (render contract: results are component-owned and immutable to
@@ -1783,6 +1799,29 @@ export class Markdown implements Component {
 		this.#ignoreTight = ignore;
 		this.invalidate();
 		return this;
+	}
+	/**
+	 * Highlight the Nth fenced code block (0-based, column-0 backtick fences —
+	 * the same grammar the coding agent's copy-target extraction uses).
+	 * `undefined` clears. The block's rows re-render with the theme's
+	 * `codeBlockHighlight` background.
+	 */
+	setHighlightedFence(index: number | undefined): this {
+		const next = index === undefined ? -1 : index;
+		if (this.#highlightedFence === next) return this;
+		this.#highlightedFence = next;
+		this.invalidate();
+		return this;
+	}
+	/**
+	 * Row span of the selected fence within the last full (final-mode) render's
+	 * content lines — the row range the coding agent's reveal scrolls to.
+	 * Undefined when nothing is highlighted or only transient renders ran.
+	 */
+	getHighlightedFenceRowRange(width: number): { start: number; end: number } | undefined {
+		// Ensure a render at this width recorded the span (cheap when cached).
+		this.render(width);
+		return this.#highlightedFenceRows;
 	}
 
 	constructor(
@@ -2193,6 +2232,7 @@ export class Markdown implements Component {
 
 		// Parse markdown to HTML-like tokens
 		const tokens = this.#lexTokens(normalizedText);
+		this.#highlightedFenceToken = this.#resolveHighlightedFenceToken(tokens);
 		let contentLines: string[];
 		this.#activeRenderSignature = signature;
 		try {
@@ -2262,6 +2302,7 @@ export class Markdown implements Component {
 			paddingX,
 			paddingY: this.#paddingY,
 			codeBlockIndent: this.#codeBlockIndent,
+			highlightedFence: this.#highlightedFence,
 			themeId: objectId(this.#theme),
 			defaultTextStyleId: this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1,
 			imageProtocol: TERMINAL.imageProtocol ?? "",
@@ -2277,7 +2318,27 @@ export class Markdown implements Component {
 	}
 
 	#renderCacheKey(normalizedText: string, signature: RenderSignature): string {
-		return `${normalizedText}\x00${signature.width}\x00${signature.paddingX}\x00${signature.paddingY}\x00${signature.codeBlockIndent}\x00${signature.themeId}\x00${signature.defaultTextStyleId}\x00${signature.imageProtocol}\x00${signature.hyperlinks ? 1 : 0}\x00${signature.textSizing ? 1 : 0}\x00${signature.bgColorProbe}\x00${signature.headingProbe}`;
+		return `${normalizedText}\x00${signature.width}\x00${signature.paddingX}\x00${signature.paddingY}\x00${signature.codeBlockIndent}\x00${signature.highlightedFence}\x00${signature.themeId}\x00${signature.defaultTextStyleId}\x00${signature.imageProtocol}\x00${signature.hyperlinks ? 1 : 0}\x00${signature.textSizing ? 1 : 0}\x00${signature.bgColorProbe}\x00${signature.headingProbe}`;
+	}
+
+	/** Resolve the selected fence's token for this render pass, or undefined. */
+	#resolveHighlightedFenceToken(tokens: Token[]): Token | undefined {
+		if (this.#highlightedFence < 0) return undefined;
+		let ordinal = -1;
+		for (const token of tokens) {
+			if (token.type !== "code") continue;
+			const raw = "raw" in token && typeof token.raw === "string" ? token.raw : "";
+			// Count only column-0 backtick fences — the same grammar the coding
+			// agent's copy-target extraction uses, so highlight ordinals always
+			// line up with the block a copy action reports.
+			if (!raw.startsWith("```")) continue;
+			// Empty fences carry nothing to copy; the extraction skips them too.
+			const body = "text" in token && typeof token.text === "string" ? token.text : "";
+			if (body.trim().length === 0) continue;
+			ordinal++;
+			if (ordinal === this.#highlightedFence) return token;
+		}
+		return undefined;
 	}
 
 	#renderStreamingContentLines(
@@ -2340,6 +2401,7 @@ export class Markdown implements Component {
 		if (cache.paddingX !== signature.paddingX) return undefined;
 		if (cache.paddingY !== signature.paddingY) return undefined;
 		if (cache.codeBlockIndent !== signature.codeBlockIndent) return undefined;
+		if (cache.highlightedFence !== signature.highlightedFence) return undefined;
 		if (cache.themeId !== signature.themeId) return undefined;
 		if (cache.defaultTextStyleId !== signature.defaultTextStyleId) return undefined;
 		if (cache.imageProtocol !== signature.imageProtocol) return undefined;
@@ -2424,6 +2486,7 @@ export class Markdown implements Component {
 		if (cache.paddingX !== signature.paddingX) return start;
 		if (cache.paddingY !== signature.paddingY) return start;
 		if (cache.codeBlockIndent !== signature.codeBlockIndent) return start;
+		if (cache.highlightedFence !== signature.highlightedFence) return start;
 		if (cache.themeId !== signature.themeId) return start;
 		if (cache.defaultTextStyleId !== signature.defaultTextStyleId) return start;
 		if (cache.imageProtocol !== signature.imageProtocol) return start;
@@ -2475,7 +2538,7 @@ export class Markdown implements Component {
 						wrappedLines.push(renderedRow);
 					} else {
 						for (const wrappedLine of wrappedRows) {
-							wrappedLines.push(renderedLine(wrappedLine, renderedRow.literalCode));
+							wrappedLines.push(renderedLine(wrappedLine, renderedRow.literalCode, renderedRow.highlighted));
 						}
 					}
 				}
@@ -2546,7 +2609,12 @@ export class Markdown implements Component {
 			}
 			const lineWithMargins = leftMargin + line + rightMargin;
 
-			if (bgFn) {
+			const highlightFn = renderedLine.highlighted === true ? this.#theme.codeBlockHighlight : undefined;
+			if (highlightFn) {
+				// Selected fence rows: fill the highlight across the full width so
+				// the selection reads as a rectangle, not a clipped text bar.
+				contentLines.push(applyBackgroundToLine(lineWithMargins, signature.width, highlightFn));
+			} else if (bgFn) {
 				contentLines.push(applyBackgroundToLine(lineWithMargins, signature.width, bgFn));
 			} else {
 				// No background - just pad to width
@@ -2585,17 +2653,39 @@ export class Markdown implements Component {
 				wrappedStart = wrappedEnd;
 			}
 		}
+		// Record the selected fence's row span on the full final pass, so the
+		// coding agent can scroll the transcript to the exact block.
+		if (end === tokens.length && this.#highlightedFenceToken !== undefined) {
+			let found = false;
+			let contentCursor = 0;
+			for (let i = start; i < end; i++) {
+				const rowCount = tokenWrappedRowCounts[i]!;
+				if (tokens[i] === this.#highlightedFenceToken) {
+					this.#highlightedFenceRows = {
+						start: contentCursor,
+						end: contentCursor + Math.max(0, rowCount - 1),
+					};
+					found = true;
+					break;
+				}
+				contentCursor += rowCount;
+			}
+			if (!found) this.#highlightedFenceRows = undefined;
+		}
 
 		return contentLines;
 	}
 
-	#renderCodeBodyLines(token: Token, codeIndent: string): RenderedLine[] {
+	#renderCodeBodyLines(token: Token, codeIndent: string, highlight?: (line: string) => string): RenderedLine[] {
 		const literalCode = this.#codeBlockIndent === 0;
 		const bodyLines: RenderedLine[] = [];
 		const tokenText = "text" in token && typeof token.text === "string" ? token.text : "";
 		const lang = "lang" in token && typeof token.lang === "string" ? token.lang : undefined;
 		const addBodyLine = (line: string): void => {
-			bodyLines.push(renderedLine(literalCode ? line : codeIndent + line, literalCode));
+			// Literal rows skip the pad pass, so they need the inline wrap; the
+			// pad pass fills non-literal rows from the `highlighted` flag.
+			const styled = highlight && literalCode ? highlight(line) : line;
+			bodyLines.push(renderedLine(literalCode ? styled : codeIndent + styled, literalCode, highlight !== undefined));
 		};
 
 		const streaming = this.transientRenderCache && !this.#renderingStablePrefix;
@@ -2685,6 +2775,7 @@ export class Markdown implements Component {
 			cache.paddingX === signature.paddingX &&
 			cache.paddingY === signature.paddingY &&
 			cache.codeBlockIndent === signature.codeBlockIndent &&
+			cache.highlightedFence === signature.highlightedFence &&
 			cache.themeId === signature.themeId &&
 			cache.defaultTextStyleId === signature.defaultTextStyleId &&
 			cache.imageProtocol === signature.imageProtocol &&
@@ -2933,11 +3024,23 @@ export class Markdown implements Component {
 				}
 
 				const codeIndent = padding(this.#codeBlockIndent);
-				lines.push(renderedLine(this.#theme.codeBlockBorder(`\`\`\`${token.lang || ""}`)));
-				for (const bodyLine of this.#renderCodeBodyLines(token, codeIndent)) {
+				const blockHighlight = this.#theme.codeBlockHighlight;
+				const highlighted = token === this.#highlightedFenceToken && blockHighlight !== undefined;
+				const borderLine = (text: string): RenderedLine => {
+					const styled = this.#theme.codeBlockBorder(text);
+					// Border rows are non-literal; the pad pass fills the highlight
+					// across the full width from the `highlighted` flag.
+					return highlighted ? renderedLine(styled, false, true) : renderedLine(styled);
+				};
+				lines.push(borderLine(`\`\`\`${token.lang || ""}`));
+				for (const bodyLine of this.#renderCodeBodyLines(
+					token,
+					codeIndent,
+					highlighted ? blockHighlight : undefined,
+				)) {
 					lines.push(bodyLine);
 				}
-				lines.push(renderedLine(this.#theme.codeBlockBorder("```")));
+				lines.push(borderLine("```"));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(renderedLine("")); // Add spacing after code blocks (unless space token follows)
 				}

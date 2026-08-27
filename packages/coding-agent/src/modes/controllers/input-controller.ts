@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
@@ -19,6 +19,11 @@ import { createPromptActionAutocompleteProvider } from "../../modes/prompt-actio
 import { parseQueueShorthand, splitQueuedMessages } from "../../modes/queue-input";
 import { buildSkillCommandPrompt, isKnownSkillCommand } from "../../modes/skill-command";
 import type { InteractiveModeContext } from "../../modes/types";
+import {
+	dedentCodeBlock,
+	extractCodeBlocksNewestFirst,
+	locateCodeBlockInMessage,
+} from "../../modes/utils/copy-targets";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
@@ -186,6 +191,12 @@ export class InputController {
 	#btwBranchListenerInstalled = false;
 	#btwCopyListenerInstalled = false;
 	#expandToolsListenerInstalled = false;
+	#copyCodeBlockListenerInstalled = false;
+	#transcriptRevealDismissListenerInstalled = false;
+	#copyCodeBlockSession: unknown = undefined;
+	#copyCodeBlockTotal = 0;
+	#copyCodeBlockIndex = 0;
+	#revealedCodeBlockComponent: AssistantMessageComponent | undefined;
 
 	/** Return the last full editor snapshot delivered by its change contract. */
 	getDraftText(): string {
@@ -312,6 +323,35 @@ export class InputController {
 				if (this.ctx.ui.getFocused() instanceof TreeSelectorComponent && matchesKey(data, "ctrl+o"))
 					return undefined;
 				this.toggleToolOutputExpansion();
+				return { consume: true };
+			});
+		}
+		if (!this.#copyCodeBlockListenerInstalled) {
+			this.#copyCodeBlockListenerInstalled = true;
+			// Alt+Y / Alt+Shift+Y copy the nearest fenced code block from the
+			// active session. Focus-agnostic like `app.tools.expand`: input
+			// listeners run before the focused component, so the actions fire
+			// from the composer, selectors/sidebars, and overlays alike.
+			this.ctx.ui.addInputListener(data => {
+				if (this.ctx.keybindings.matches(data, "app.clipboard.copyCodeBlock")) {
+					this.handleCopyCodeBlock();
+					return { consume: true };
+				}
+				if (this.ctx.keybindings.matches(data, "app.clipboard.copyCodeBlockPrev")) {
+					this.handleCopyCodeBlockPrev();
+					return { consume: true };
+				}
+				return undefined;
+			});
+		}
+		if (!this.#transcriptRevealDismissListenerInstalled) {
+			this.#transcriptRevealDismissListenerInstalled = true;
+			// Any key while a copied-block peek is presented restores the live
+			// tail. Registered after the copy listener so Alt+Y / Alt+Shift+Y
+			// cycle to the next block without first dismissing the peek.
+			this.ctx.ui.addInputListener(() => {
+				if (!this.ctx.hasTranscriptReveal()) return undefined;
+				this.ctx.setTranscriptReveal(undefined);
 				return { consume: true };
 			});
 		}
@@ -1948,6 +1988,8 @@ export class InputController {
 			keybindings: this.ctx.keybindings,
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
+			copyCodeBlock: () => this.handleCopyCodeBlock(),
+			copyCodeBlockPrev: () => this.handleCopyCodeBlockPrev(),
 			undo: prefix => this.ctx.editor.undoPastTransientText(prefix),
 			moveCursorToMessageEnd: () => this.ctx.editor.moveToMessageEnd(),
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
@@ -1988,6 +2030,70 @@ export class InputController {
 			this.ctx.showStatus(`Copied: ${preview}`);
 		} catch {
 			this.ctx.showWarning("Failed to copy to clipboard");
+		}
+	}
+	/** Copy the nearest code block; Alt+Y again walks to older blocks. */
+	handleCopyCodeBlock(): void {
+		this.#copyCodeBlockCycle(1);
+	}
+
+	/** Walk the code-block cycle toward newer blocks (Alt+Shift+Y). */
+	handleCopyCodeBlockPrev(): void {
+		this.#copyCodeBlockCycle(-1);
+	}
+
+	#copyCodeBlockCycle(direction: 1 | -1): void {
+		const session = this.ctx.viewSession;
+		const refs = extractCodeBlocksNewestFirst(session.messages);
+		if (refs.length === 0) {
+			this.ctx.showStatus("No code block found", { autoDismissMs: 2500 });
+			return;
+		}
+		if (session !== this.#copyCodeBlockSession) {
+			this.#copyCodeBlockSession = session;
+			this.#copyCodeBlockIndex = 0;
+		} else if (refs.length > this.#copyCodeBlockTotal) {
+			// New code blocks arrived since the last press — reset to the newest.
+			this.#copyCodeBlockIndex = 0;
+		}
+		this.#copyCodeBlockTotal = refs.length;
+		if (this.#copyCodeBlockIndex >= refs.length) this.#copyCodeBlockIndex = 0; // compaction shrank the list
+		let index = this.#copyCodeBlockIndex;
+		if (direction === -1) index = (index - 1 + refs.length) % refs.length;
+		const ref = refs[index]!;
+		this.#copyCodeBlockIndex = direction === 1 ? (index + 1) % refs.length : index;
+		try {
+			copyToClipboard(dedentCodeBlock(ref.block.code));
+		} catch {
+			this.ctx.showWarning("Failed to copy to clipboard");
+			return;
+		}
+		this.ctx.showStatus(
+			refs.length > 1
+				? `Copied code block (${index + 1} of ${refs.length}) — press again for previous`
+				: "Copied code block",
+			{ autoDismissMs: 2500 },
+		);
+		this.#revealCopiedBlock(ref.message, ref.blockIndex, index + 1, refs.length);
+	}
+
+	#revealCopiedBlock(message: AgentMessage, blockIndex: number, n: number, total: number): void {
+		const previous = this.#revealedCodeBlockComponent;
+		if (previous) previous.setCopiedBlockMarker(undefined);
+		if (previous) previous.setHighlightedCodeBlock(undefined);
+		this.#revealedCodeBlockComponent = undefined;
+		const component =
+			this.ctx.transcriptMessageComponents.get(message) ??
+			(this.ctx.streamingMessage === message ? this.ctx.streamingComponent : undefined);
+		if (component instanceof AssistantMessageComponent) {
+			component.setCopiedBlockMarker(`❯ Copied code block ${n} of ${total}`);
+			this.#revealedCodeBlockComponent = component;
+			const location = locateCodeBlockInMessage(message, blockIndex);
+			if (location) component.setHighlightedCodeBlock(location);
+			// Present the transcript slice ending at the copied block so the
+			// user can see it even when it scrolled out of the recent output;
+			// the composer drops the peek when the block is already visible.
+			this.ctx.setTranscriptReveal({ component, label: `Copied code block ${n} of ${total}` });
 		}
 	}
 
