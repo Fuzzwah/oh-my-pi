@@ -159,12 +159,16 @@ export class UiHelpers {
 			this.#statusDismissTimer = setTimeout(() => {
 				this.#statusDismissTimer = undefined;
 				// Only blank the line while it is still the live tail; a superseded
-				// or scrollback-committed status must not be mutated.
+				// or scrollback-committed status must not be mutated. Identity is
+				// not enough — TranscriptContainer retains committed components in
+				// `children`, so the tail check is gated on the block still being
+				// removable (transient, no emitted/committed tape history).
 				const current = this.ctx.chatContainer.children;
 				if (
 					current.length >= 2 &&
 					current[current.length - 2] === this.ctx.lastStatusSpacer &&
-					current[current.length - 1] === this.ctx.lastStatusText
+					current[current.length - 1] === this.ctx.lastStatusText &&
+					this.ctx.chatContainer.canRemoveBlock(this.ctx.lastStatusText)
 				) {
 					this.ctx.lastStatusText.setText("");
 					this.ctx.ui.requestRender();

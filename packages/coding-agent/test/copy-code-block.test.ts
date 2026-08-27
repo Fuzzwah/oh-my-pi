@@ -335,6 +335,38 @@ describe("copy code block hotkeys", () => {
 		expect(copySpy).toHaveBeenLastCalledWith("blockA");
 	});
 
+	it("moves on direction changes instead of repeating the selected block", async () => {
+		// Regression: the stored index used to mean "next older after a forward
+		// copy" but "current after a reverse copy", so switching direction
+		// re-copied the same block. The stored index is now always the last
+		// copied block and the direction is applied before each selection.
+		const { InputController, ctx, messages, spies } = await createContext();
+		messages.push(assistantText("A\n```\nblockA\n```"));
+		messages.push(assistantText("B\n```\nblockB\n```"));
+		messages.push(assistantText("C\n```\nblockC\n```"));
+		const copySpy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValue(undefined);
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const listeners = registeredInputListeners(spies.addInputListener);
+
+		// [newest, middle, oldest] = [blockC, blockB, blockA].
+		dispatchInput(listeners, ALT_Y); // newest
+		expect(copySpy).toHaveBeenLastCalledWith("blockC");
+		dispatchInput(listeners, ALT_Y); // older
+		expect(copySpy).toHaveBeenLastCalledWith("blockB");
+		// Reversing must move toward newer, not re-copy the block just shown.
+		dispatchInput(listeners, ALT_SHIFT_Y);
+		expect(copySpy).toHaveBeenLastCalledWith("blockC");
+		// From the newest, toward newer wraps to the oldest.
+		dispatchInput(listeners, ALT_SHIFT_Y);
+		expect(copySpy).toHaveBeenLastCalledWith("blockA");
+		// From the oldest, toward older wraps to the newest.
+		dispatchInput(listeners, ALT_Y);
+		expect(copySpy).toHaveBeenLastCalledWith("blockC");
+		// Every press moved; nothing repeated.
+		expect(copySpy).toHaveBeenCalledTimes(5);
+	});
+
 	it("resets to the newest when new code blocks arrive between presses", async () => {
 		const { InputController, ctx, messages, spies } = await createContext();
 		messages.push(assistantText("first\n```\nfirstBlock\n```"));

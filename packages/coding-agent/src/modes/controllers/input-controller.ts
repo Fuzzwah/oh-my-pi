@@ -2057,19 +2057,29 @@ export class InputController {
 			this.ctx.showStatus("No code block found", { autoDismissMs: 2500 });
 			return;
 		}
+		let fresh = false;
 		if (session !== this.#copyCodeBlockSession) {
 			this.#copyCodeBlockSession = session;
-			this.#copyCodeBlockIndex = 0;
+			fresh = true;
 		} else if (refs.length > this.#copyCodeBlockTotal) {
 			// New code blocks arrived since the last press — reset to the newest.
-			this.#copyCodeBlockIndex = 0;
+			fresh = true;
 		}
 		this.#copyCodeBlockTotal = refs.length;
-		if (this.#copyCodeBlockIndex >= refs.length) this.#copyCodeBlockIndex = 0; // compaction shrank the list
-		let index = this.#copyCodeBlockIndex;
-		if (direction === -1) index = (index - 1 + refs.length) % refs.length;
+		// #copyCodeBlockIndex is always the last copied block. A fresh cycle
+		// starts at the far end for the pressed direction — newest for Alt+Y,
+		// oldest for Alt+Shift+Y — so the first press of either action never
+		// repeats the other's previous selection. Otherwise move by `direction`
+		// from the last copied block, wrapping: Alt+Y walks older, Alt+Shift+Y
+		// newer, and switching direction always moves instead of re-copying.
+		if (fresh || this.#copyCodeBlockIndex >= refs.length) {
+			// Compaction shrank the list past the stored index — restart clean.
+			this.#copyCodeBlockIndex = direction === 1 ? 0 : refs.length - 1;
+		} else {
+			this.#copyCodeBlockIndex = (this.#copyCodeBlockIndex + direction + refs.length) % refs.length;
+		}
+		const index = this.#copyCodeBlockIndex;
 		const ref = refs[index]!;
-		this.#copyCodeBlockIndex = direction === 1 ? (index + 1) % refs.length : index;
 		try {
 			copyToClipboard(dedentCodeBlock(ref.block.code));
 		} catch {

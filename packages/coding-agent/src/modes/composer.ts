@@ -251,11 +251,19 @@ export class Composer implements TerminalFrameProvider {
 				: undefined;
 			const blockStart = range === undefined ? undefined : range.start + (inner?.start ?? 0);
 			const blockEnd = range === undefined ? undefined : range.start + (inner?.end ?? range.end - range.start);
+			// The transcript's normal viewport is the terminal height minus the
+			// fixed roots above (header/pre) and below (editor, status, …) — the
+			// same capacity the live tail renders into. A block inside the last
+			// `after` rows of a full-height tail is hidden by the post-transcript
+			// chrome and must still reveal.
+			const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
+			const headerRows = headerVisible ? this.#header.render(width) : [];
+			const capacity = Math.max(0, rows - headerRows.length - preRoots.length - after.length);
 			if (
 				range === undefined ||
 				blockStart === undefined ||
 				blockEnd === undefined ||
-				blockStart >= full.length - rows
+				blockStart >= full.length - capacity
 			) {
 				// Block missing or already fully visible — drop the peek.
 				this.#transcriptReveal = undefined;

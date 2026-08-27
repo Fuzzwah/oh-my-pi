@@ -74,12 +74,30 @@ describe("Composer transcript reveal", () => {
 		expect(frame.viewport.join("\n")).toContain("press any key to return to the live view");
 	});
 
-	it("drops the peek when the block is already fully visible", async () => {
-		const { composer, target } = await setup(5, 0);
+	it("keeps the peek when the block sits behind post-transcript chrome", () => {
+		// Regression: the visibility test used the full terminal height, so a
+		// block inside the transcript's last `after` rows was classified as
+		// visible even though the editor/status below the transcript hide it.
+		// 10-row frame, 5-row HUD after the transcript: the old test dropped
+		// the peek (blockStart 5 >= full.length - 10), the fixed one reveals.
+		const terminal = new VirtualTerminal(80, 10);
+		const composer = new Composer({ preferences: COMPOSER_DEFAULTS, terminal });
+		composer.start();
+		const transcript = new TranscriptContainer();
+		const filler = new Text(Array.from({ length: 5 }, (_, i) => `filler line ${i}`).join("\n"), 1, 0);
+		const target = new Text("TARGET BLOCK LINE", 1, 0);
+		const tail = new Text(Array.from({ length: 9 }, (_, i) => `tail line ${i}`).join("\n"), 1, 0);
+		const hud = new Text(Array.from({ length: 5 }, (_, i) => `hud line ${i}`).join("\n"), 1, 0);
+		transcript.addChild(filler);
+		transcript.addChild(target);
+		transcript.addChild(tail);
+		composer.setRuntimeChildren([transcript, hud]);
 
 		composer.setTranscriptReveal({ component: target, label: "Copied code block 1 of 1" });
-		composer.renderFrame({ columns: 80, rows: 32 });
-		expect(composer.hasTranscriptReveal()).toBe(false);
+		const frame = composer.renderFrame({ columns: 80, rows: 10 });
+
+		expect(composer.hasTranscriptReveal()).toBe(true);
+		expect(frame.viewport.join("\n")).toContain("TARGET BLOCK LINE");
 	});
 
 	it("restores the live tail on dismiss", async () => {
